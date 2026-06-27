@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.0.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -320,18 +320,30 @@ parse_args() {
     esac
   done
 
-  [[ ${SAW_PORT_ARG} -eq 1 && ${SAW_NO_PORT} -eq 1 ]] && die "--port 与 --no-change-port 不能同时使用"
-  [[ ${SAW_PUBKEY_ARG} -eq 1 && ${SAW_NO_KEYONLY} -eq 1 ]] && die "--pubkey/--pubkey-file 与 --no-key-only 不能同时使用"
-  [[ ${SAW_GRUB_YES} -eq 1 && ${SAW_GRUB_NO} -eq 1 ]] && die "--grub-ipv6 与 --no-grub-ipv6 不能同时使用"
-  [[ -n "${PUBKEY_TEXT}" && -n "${PUBKEY_FILE}" ]] && die "--pubkey 与 --pubkey-file 不能同时使用"
+  if [[ ${SAW_PORT_ARG} -eq 1 && ${SAW_NO_PORT} -eq 1 ]]; then
+    die "--port 与 --no-change-port 不能同时使用"
+  fi
+  if [[ ${SAW_PUBKEY_ARG} -eq 1 && ${SAW_NO_KEYONLY} -eq 1 ]]; then
+    die "--pubkey/--pubkey-file 与 --no-key-only 不能同时使用"
+  fi
+  if [[ ${SAW_GRUB_YES} -eq 1 && ${SAW_GRUB_NO} -eq 1 ]]; then
+    die "--grub-ipv6 与 --no-grub-ipv6 不能同时使用"
+  fi
+  if [[ -n "${PUBKEY_TEXT}" && -n "${PUBKEY_FILE}" ]]; then
+    die "--pubkey 与 --pubkey-file 不能同时使用"
+  fi
   if [[ "${STEP_PORT}" == "yes" ]]; then
     is_valid_port "${SSH_PORT}" || die "端口无效：${SSH_PORT}"
   fi
-  [[ -n "${PUBKEY_FILE}" && ! -f "${PUBKEY_FILE}" ]] && die "公钥文件不存在：${PUBKEY_FILE}"
+  if [[ -n "${PUBKEY_FILE}" && ! -f "${PUBKEY_FILE}" ]]; then
+    die "公钥文件不存在：${PUBKEY_FILE}"
+  fi
   if [[ -n "${CREATE_USER}" ]]; then
     is_valid_username "${CREATE_USER}" || die "用户名无效：${CREATE_USER}"
   fi
-  [[ ${DISABLE_ROOT_LOGIN} -eq 1 && -z "${CREATE_USER}" ]] && die "--disable-root-login 必须配合 --create-user"
+  if [[ ${DISABLE_ROOT_LOGIN} -eq 1 && -z "${CREATE_USER}" ]]; then
+    die "--disable-root-login 必须配合 --create-user"
+  fi
 }
 
 detect_os() {
@@ -620,7 +632,9 @@ setup_key_only_config() {
     if [[ ${DRY_RUN} -eq 1 && ${dry_run_generate} -eq 1 ]]; then
       info "[dry-run] 将生成 ${generated_key}，打印私钥后删除服务器端私钥，仅保留 .pub 和 authorized_keys。"
     else
-    [[ -e "${generated_key}" || -e "${generated_key}.pub" ]] && die "${generated_key} 或 .pub 已存在；请先手动处理或提供公钥。"
+    if [[ -e "${generated_key}" || -e "${generated_key}.pub" ]]; then
+      die "${generated_key} 或 .pub 已存在；请先手动处理或提供公钥。"
+    fi
     run_or_dry mkdir -p /root/.ssh
     run_or_dry chmod 700 /root/.ssh
     run_or_dry ssh-keygen -t ed25519 -a 64 -f "${generated_key}" -N "" -C "root@$(hostname)-$(date +%F)"
@@ -642,10 +656,14 @@ setup_key_only_config() {
     fi
   fi
 
-  [[ ${DRY_RUN} -eq 1 ]] || authorized_keys_has_valid_key /root/.ssh/authorized_keys || die "authorized_keys 中未检测到有效 SSH 公钥。"
+  if [[ ${DRY_RUN} -eq 0 ]] && ! authorized_keys_has_valid_key /root/.ssh/authorized_keys; then
+    die "authorized_keys 中未检测到有效 SSH 公钥。"
+  fi
 
   local root_login="prohibit-password"
-  [[ ${DISABLE_ROOT_LOGIN} -eq 1 ]] && root_login="no"
+  if [[ ${DISABLE_ROOT_LOGIN} -eq 1 ]]; then
+    root_login="no"
+  fi
   write_file_atomic "${HARDEN_DROPIN}" 0644 "# Managed by ${SCRIPT_NAME} - key-only hardening
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -678,7 +696,10 @@ create_sudo_user_if_requested() {
   else
     warn "未找到 sudo/wheel 组，请手动授予 ${CREATE_USER} 管理权限。"
   fi
-  [[ ${DRY_RUN} -eq 1 ]] && { info "[dry-run] 将复制 root authorized_keys 到 ${CREATE_USER}"; return 0; }
+  if [[ ${DRY_RUN} -eq 1 ]]; then
+    info "[dry-run] 将复制 root authorized_keys 到 ${CREATE_USER}"
+    return 0
+  fi
   authorized_keys_has_valid_key /root/.ssh/authorized_keys || die "root authorized_keys 无有效公钥，无法安全创建可登录用户。"
   mkdir -p "${user_home}/.ssh"
   cp -a /root/.ssh/authorized_keys "${user_home}/.ssh/authorized_keys"
@@ -694,7 +715,9 @@ test_sshd() {
 
 reload_sshd() {
   run_or_dry systemctl reload "${SSH_SERVICE}" || run_or_dry systemctl restart "${SSH_SERVICE}"
-  [[ ${DRY_RUN} -eq 1 ]] || systemctl is-active --quiet "${SSH_SERVICE}"
+  if [[ ${DRY_RUN} -eq 0 ]]; then
+    systemctl is-active --quiet "${SSH_SERVICE}"
+  fi
   ok "SSH 服务已重载/重启：${SSH_SERVICE}"
 }
 
@@ -705,36 +728,66 @@ sshd_t_value() {
 
 assert_ssh_state() {
   local run_port="$1" run_key="$2"
-  [[ ${DRY_RUN} -eq 1 ]] && { info "[dry-run] 跳过最终 SSH 状态断言"; return 0; }
+  if [[ ${DRY_RUN} -eq 1 ]]; then
+    info "[dry-run] 跳过最终 SSH 状态断言"
+    return 0
+  fi
   local v ports root_login
   if [[ "${run_key}" -eq 1 ]]; then
-    v="$(sshd_t_value passwordauthentication)"; [[ "${v}" == "no" ]] || die "断言失败：passwordauthentication=${v}"
-    v="$(sshd_t_value kbdinteractiveauthentication)"; [[ "${v}" == "no" ]] || die "断言失败：kbdinteractiveauthentication=${v}"
-    v="$(sshd_t_value permitemptypasswords)"; [[ "${v}" == "no" ]] || die "断言失败：permitemptypasswords=${v}"
-    v="$(sshd_t_value pubkeyauthentication)"; [[ "${v}" == "yes" ]] || die "断言失败：pubkeyauthentication=${v}"
+    v="$(sshd_t_value passwordauthentication)"
+    if [[ "${v}" != "no" ]]; then
+      die "断言失败：passwordauthentication=${v}"
+    fi
+    v="$(sshd_t_value kbdinteractiveauthentication)"
+    if [[ "${v}" != "no" ]]; then
+      die "断言失败：kbdinteractiveauthentication=${v}"
+    fi
+    v="$(sshd_t_value permitemptypasswords)"
+    if [[ "${v}" != "no" ]]; then
+      die "断言失败：permitemptypasswords=${v}"
+    fi
+    v="$(sshd_t_value pubkeyauthentication)"
+    if [[ "${v}" != "yes" ]]; then
+      die "断言失败：pubkeyauthentication=${v}"
+    fi
     root_login="prohibit-password"
-    [[ ${DISABLE_ROOT_LOGIN} -eq 1 ]] && root_login="no"
-    v="$(sshd_t_value permitrootlogin)"; [[ "${v}" == "${root_login}" ]] || die "断言失败：permitrootlogin=${v}"
+    if [[ ${DISABLE_ROOT_LOGIN} -eq 1 ]]; then
+      root_login="no"
+    fi
+    v="$(sshd_t_value permitrootlogin)"
+    if [[ "${v}" != "${root_login}" ]]; then
+      die "断言失败：permitrootlogin=${v}"
+    fi
   fi
   if [[ "${run_port}" -eq 1 ]]; then
     ports="$("${SSHD_BIN}" -T | awk '$1=="port"{print $2}')"
-    echo "${ports}" | grep -qx "${SSH_PORT}" || die "断言失败：sshd -T 未包含端口 ${SSH_PORT}"
+    if ! echo "${ports}" | grep -qx "${SSH_PORT}"; then
+      die "断言失败：sshd -T 未包含端口 ${SSH_PORT}"
+    fi
     if echo "${ports}" | grep -vx "${SSH_PORT}" | grep -q .; then
       die "断言失败：sshd -T 仍包含非目标端口：$(echo "${ports}" | tr '\n' ' ')"
     fi
-    ss -lntH | awk -v port="${SSH_PORT}" '$4 ~ ("[:.]" port "$") {found=1} END {exit found?0:1}' || die "断言失败：未监听 ${SSH_PORT}/tcp"
+    if ! ss -lntH | awk -v port="${SSH_PORT}" '$4 ~ ("[:.]" port "$") {found=1} END {exit found?0:1}'; then
+      die "断言失败：未监听 ${SSH_PORT}/tcp"
+    fi
   fi
   ok "SSH 最终状态断言通过。"
 }
 
 apply_ssh_stage() {
   local run_port="$1" run_key="$2"
-  [[ "${run_port}" -eq 0 && "${run_key}" -eq 0 && -z "${CREATE_USER}" ]] && return 0
+  if [[ "${run_port}" -eq 0 && "${run_key}" -eq 0 && -z "${CREATE_USER}" ]]; then
+    return 0
+  fi
   start_stage "ssh"
   snapshot_ssh
   normalize_sshd_dropin_include
-  [[ "${run_port}" -eq 1 ]] && prepare_ssh_port_config "${SSH_PORT}"
-  [[ "${run_key}" -eq 1 ]] && setup_key_only_config
+  if [[ "${run_port}" -eq 1 ]]; then
+    prepare_ssh_port_config "${SSH_PORT}"
+  fi
+  if [[ "${run_key}" -eq 1 ]]; then
+    setup_key_only_config
+  fi
   create_sudo_user_if_requested
   test_sshd
   reload_sshd
@@ -752,9 +805,15 @@ net.ipv6.conf.lo.disable_ipv6 = 1
 "
   run_or_dry sysctl -p "${conf}"
   if [[ ${DRY_RUN} -eq 0 ]]; then
-    [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == "1" ]] || die "IPv6 all.disable_ipv6 未生效"
-    [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" == "1" ]] || die "IPv6 default.disable_ipv6 未生效"
-    [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)" == "1" ]] || die "IPv6 lo.disable_ipv6 未生效"
+    if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" != "1" ]]; then
+      die "IPv6 all.disable_ipv6 未生效"
+    fi
+    if [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" != "1" ]]; then
+      die "IPv6 default.disable_ipv6 未生效"
+    fi
+    if [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)" != "1" ]]; then
+      die "IPv6 lo.disable_ipv6 未生效"
+    fi
   fi
   end_stage
   ok "IPv6 sysctl 禁用已应用。"
@@ -821,7 +880,9 @@ net.ipv4.tcp_congestion_control = bbr
 "
   run_or_dry sysctl -p "${conf}"
   if [[ ${DRY_RUN} -eq 0 ]]; then
-    [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] || die "BBR 未生效"
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
+      die "BBR 未生效"
+    fi
   fi
   end_stage
   ok "BBR 已启用。"
@@ -888,7 +949,9 @@ main() {
   echo -e "${BLUE}  VPS 安全初始化脚本 v${SCRIPT_VERSION}${NC}"
   echo -e "${BLUE}  兼容目标: Ubuntu 22/24, Debian 12/13${NC}"
   echo -e "${BLUE}==========================================================${NC}"
-  [[ ${DRY_RUN} -eq 1 ]] && warn "当前为 dry-run，不会写入系统。"
+  if [[ ${DRY_RUN} -eq 1 ]]; then
+    warn "当前为 dry-run，不会写入系统。"
+  fi
 
   local run_ipv6=0 run_bbr=0 run_port=0 run_key=0
   if resolve_step "${STEP_IPV6}" "1) 是否禁用 IPv6？" "yes"; then run_ipv6=1; fi
@@ -901,8 +964,16 @@ main() {
     is_valid_port "${SSH_PORT}" || die "SSH 端口无效：${SSH_PORT}"
   fi
 
-  [[ ${run_ipv6} -eq 1 ]] && disable_ipv6 || info "已跳过 IPv6 禁用。"
-  [[ ${run_bbr} -eq 1 ]] && enable_bbr || info "已跳过 BBR 启用。"
+  if [[ ${run_ipv6} -eq 1 ]]; then
+    disable_ipv6
+  else
+    info "已跳过 IPv6 禁用。"
+  fi
+  if [[ ${run_bbr} -eq 1 ]]; then
+    enable_bbr
+  else
+    info "已跳过 BBR 启用。"
+  fi
   apply_ssh_stage "${run_port}" "${run_key}"
 
   show_post_checks
