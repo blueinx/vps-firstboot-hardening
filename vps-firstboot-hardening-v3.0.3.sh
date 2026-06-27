@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.0.2"
+SCRIPT_VERSION="3.0.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
